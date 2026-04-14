@@ -25,6 +25,9 @@ data:
     {{- end }}
     allowed_users = {{ $cfg.discord.allowedUsers | default list | toJson }}
     {{- if $cfg.discord.allowBotMessages }}
+    {{- if not (has $cfg.discord.allowBotMessages (list "off" "mentions" "all")) }}
+    {{- fail (printf "agents.%s.discord.allowBotMessages must be one of: off, mentions, all — got: %s" $name $cfg.discord.allowBotMessages) }}
+    {{- end }}
     allow_bot_messages = "{{ $cfg.discord.allowBotMessages }}"
     {{- end }}
     {{- range $cfg.discord.trustedBotIds }}
