@@ -11,7 +11,8 @@ use std::sync::LazyLock;
 use serenity::async_trait;
 use serenity::model::channel::{Message, ReactionType};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId};
+use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::user::User;
 use serenity::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -167,7 +168,7 @@ impl EventHandler for Handler {
         }
 
         let prompt = if is_mentioned {
-            strip_mention(&msg.content)
+            resolve_mentions(&msg.content, bot_id, &msg.mentions)
         } else {
             msg.content.trim().to_string()
         };
@@ -790,12 +791,18 @@ fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> Str
     out
 }
 
-static MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@[!&]?\d+>").unwrap()
-});
-
-fn strip_mention(content: &str) -> String {
-    MENTION_RE.replace_all(content, "").trim().to_string()
+fn resolve_mentions(content: &str, bot_id: UserId, mentions: &[User]) -> String {
+    let bot_re = regex::Regex::new(&format!(r"<@!?{}>", bot_id)).unwrap();
+    let mut out = bot_re.replace_all(content, "").to_string();
+    for user in mentions {
+        if user.id == bot_id {
+            continue;
+        }
+        let label = user.global_name.as_deref().unwrap_or(&user.name);
+        let re = regex::Regex::new(&format!(r"<@!?{}>", user.id)).unwrap();
+        out = re.replace_all(&out, format!("@{}", label)).to_string();
+    }
+    out.trim().to_string()
 }
 
 fn shorten_thread_name(prompt: &str) -> String {
