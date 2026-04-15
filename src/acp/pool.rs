@@ -26,6 +26,13 @@ pub struct SessionPool {
     max_sessions: usize,
 }
 
+type EvictionCandidate = (
+    String,
+    Arc<Mutex<AcpConnection>>,
+    Instant,
+    Option<String>,
+);
+
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
     key: &str,
@@ -100,7 +107,7 @@ impl SessionPool {
                 .collect()
         };
 
-        let mut eviction_candidate: Option<(String, Arc<Mutex<AcpConnection>>, Instant, Option<String>)> = None;
+        let mut eviction_candidate: Option<EvictionCandidate> = None;
         let mut skipped_locked_candidates = 0usize;
         for (key, conn) in snapshot {
             if key == thread_id {
