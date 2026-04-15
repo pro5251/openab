@@ -21,15 +21,12 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: openab
           image: openab:latest
           imagePullPolicy: Never
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
@@ -51,8 +48,6 @@ spec:
             - name: data
               mountPath: /home/agent/.local/share/kiro-cli
               subPath: kiro-cli-data
-            - name: tmp
-              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -60,5 +55,3 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: openab-data
-        - name: tmp
-          emptyDir: {}
