@@ -44,7 +44,11 @@ app.kubernetes.io/component: {{ .agent }}
 {{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion) */}}
 {{- define "openab.agentImage" -}}
 {{- if and .cfg.image (kindIs "string" .cfg.image) (ne .cfg.image "") }}
+{{- if contains ":" .cfg.image }}
 {{- .cfg.image }}
+{{- else }}
+{{- printf "%s:%s" .cfg.image (default .ctx.Chart.AppVersion .ctx.Values.image.tag) }}
+{{- end }}
 {{- else }}
 {{- $tag := default .ctx.Chart.AppVersion .ctx.Values.image.tag }}
 {{- printf "%s:%s" .ctx.Values.image.repository $tag }}
