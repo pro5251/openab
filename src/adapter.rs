@@ -111,6 +111,7 @@ impl AdapterRouter {
     /// Handle an incoming user message. The adapter is responsible for
     /// filtering, resolving the thread, and building the SenderContext.
     /// This method handles sender context injection, session management, and streaming.
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_message(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
