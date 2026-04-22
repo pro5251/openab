@@ -1,6 +1,7 @@
 use crate::acp::ContentBlock;
 use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
@@ -20,9 +21,6 @@ use tracing::{debug, error, info};
 /// Hard cap on consecutive bot messages in a channel or thread.
 /// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
-
-/// Absolute per-thread cap on bot turns. Cannot be overridden by config or human intervention.
-const HARD_BOT_TURN_LIMIT: u32 = 100;
 
 /// Maximum entries in the participation cache before eviction.
 const PARTICIPATION_CACHE_MAX: usize = 1000;
@@ -261,30 +259,28 @@ impl EventHandler for Handler {
             let thread_key = msg.channel_id.to_string();
             let mut tracker = self.bot_turns.lock().await;
             if msg.author.bot {
-                match tracker.on_bot_message(&thread_key) {
-                    TurnResult::HardLimit => {
-                        tracing::warn!(channel_id = %msg.channel_id, "hard bot turn limit reached");
+                match tracker.classify_bot_message(&thread_key) {
+                    TurnAction::Continue => {}
+                    TurnAction::SilentStop => return,
+                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+                        match severity {
+                            TurnSeverity::Hard => tracing::warn!(
+                                channel_id = %msg.channel_id,
+                                turns,
+                                "hard bot turn limit reached",
+                            ),
+                            TurnSeverity::Soft => tracing::info!(
+                                channel_id = %msg.channel_id,
+                                turns,
+                                max = self.max_bot_turns,
+                                "soft bot turn limit reached",
+                            ),
+                        }
                         if msg.author.id != bot_id {
-                            let _ = msg.channel_id.say(
-                                &ctx.http,
-                                format!("🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). A human must reply to continue."),
-                            ).await;
+                            let _ = msg.channel_id.say(&ctx.http, &user_message).await;
                         }
                         return;
                     }
-                    TurnResult::Stopped => return,
-                    TurnResult::SoftLimit(n) => {
-                        tracing::info!(channel_id = %msg.channel_id, turns = n, max = self.max_bot_turns, "soft bot turn limit reached");
-                        if msg.author.id != bot_id {
-                            let _ = msg.channel_id.say(
-                                &ctx.http,
-                                format!("⚠️ Bot turn limit reached ({n}/{}). A human must reply in this thread to continue bot-to-bot conversation.", self.max_bot_turns),
-                            ).await;
-                        }
-                        return;
-                    }
-                    TurnResult::Throttled => return,
-                    TurnResult::Ok => {}
                 }
             } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
                 && !msg.content.is_empty()
@@ -812,58 +808,50 @@ async fn get_or_create_thread(
         parent_id: None,
     };
     let trigger_ref = discord_msg_ref(msg);
-    adapter.create_thread(&parent, &trigger_ref, &thread_name).await
-}
-
-// --- Bot turn tracking ---
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TurnResult {
-    /// Counter below limits — continue normally.
-    Ok,
-    /// Counter == soft_limit — warn once, then stop.
-    SoftLimit(u32),
-    /// Counter > soft_limit — silently stop (already warned).
-    Throttled,
-    /// Counter == HARD_BOT_TURN_LIMIT — warn once, then stop.
-    HardLimit,
-    /// Counter > HARD_BOT_TURN_LIMIT — silently stop (already warned).
-    Stopped,
-}
-
-pub(crate) struct BotTurnTracker {
-    soft_limit: u32,
-    counts: HashMap<String, (u32, u32)>,
-}
-
-impl BotTurnTracker {
-    pub fn new(soft_limit: u32) -> Self {
-        Self { soft_limit, counts: HashMap::new() }
-    }
-
-    pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
-        let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
-        *soft += 1;
-        *hard += 1;
-        if *hard > HARD_BOT_TURN_LIMIT {
-            TurnResult::Stopped
-        } else if *hard == HARD_BOT_TURN_LIMIT {
-            TurnResult::HardLimit
-        } else if *soft > self.soft_limit {
-            TurnResult::Throttled
-        } else if *soft == self.soft_limit {
-            TurnResult::SoftLimit(*soft)
-        } else {
-            TurnResult::Ok
+    match adapter.create_thread(&parent, &trigger_ref, &thread_name).await {
+        Ok(ch) => Ok(ch),
+        Err(e) if is_thread_already_exists_error(&e) => {
+            // Another bot won the race from the same trigger message. Discord
+            // only allows one thread per message, so refetch the message and
+            // join the thread our sibling just created.
+            let refreshed = msg
+                .channel_id
+                .message(&ctx.http, msg.id)
+                .await
+                .map_err(|fe| anyhow::anyhow!(
+                    "thread_already_exists (race), but refetch failed: {fe}"
+                ))?;
+            let existing = refreshed.thread.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "thread_already_exists (race), but message has no thread after refetch"
+                )
+            })?;
+            tracing::info!(
+                channel_id = %msg.channel_id,
+                thread_id = %existing.id,
+                "joining thread created by sibling bot from same trigger message"
+            );
+            Ok(ChannelRef {
+                platform: "discord".into(),
+                channel_id: existing.id.to_string(),
+                thread_id: None,
+                parent_id: Some(msg.channel_id.get().to_string()),
+            })
         }
+        Err(e) => Err(e),
     }
+}
 
-    pub fn on_human_message(&mut self, thread_id: &str) {
-        if let Some((soft, hard)) = self.counts.get_mut(thread_id) {
-            *soft = 0;
-            *hard = 0;
-        }
-    }
+/// Detect Discord's "A thread has already been created for this message" error
+/// (JSON error code 160004). Triggered when two bots responding to the same
+/// @-mention race to create a thread from the same trigger message.
+///
+/// Uses string matching because serenity surfaces Discord API errors as
+/// formatted strings — there is no structured error code we can match on.
+/// Unit tests pin the expected patterns so serenity formatting changes are caught.
+fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("160004") || msg.contains("already been created")
 }
 
 static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -917,123 +905,6 @@ fn should_process_user_message(
 mod tests {
     use super::*;
 
-    // --- Bot turn tracker tests ---
-
-    /// Basic increment: bot messages below the soft limit return Ok.
-    #[test]
-    fn bot_turns_increment() {
-        let mut t = BotTurnTracker::new(5);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-    }
-
-    /// Soft limit: after N consecutive bot turns, returns SoftLimit.
-    #[test]
-    fn soft_limit_triggers() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-    }
-
-    /// Human message resets both soft and hard counters, allowing bots to continue.
-    #[test]
-    fn human_resets_both_counters() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        t.on_human_message("t1");
-        // Both reset — can do 2 more before soft limit
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-    }
-
-    /// Hard limit: absolute cap on bot turns, triggers after HARD_BOT_TURN_LIMIT.
-    #[test]
-    fn hard_limit_triggers() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
-    }
-
-    /// Hard limit resets on human message, allowing bots to continue.
-    #[test]
-    fn hard_limit_resets_on_human() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        t.on_human_message("t1");
-        // Hard counter reset — can go again
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-    }
-
-    /// When soft and hard limits are equal, hard limit takes precedence.
-    #[test]
-    fn hard_before_soft_when_equal() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        // soft == hard == HARD_BOT_TURN_LIMIT → hard wins
-        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
-    }
-
-    /// Turn counters are per-thread — one thread hitting the limit doesn't affect others.
-    #[test]
-    fn threads_are_independent() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
-        // t2 is unaffected
-        assert_eq!(t.on_bot_message("t2"), TurnResult::Ok);
-    }
-
-    /// Human message on an unknown thread is a no-op (should not panic).
-    #[test]
-    fn human_on_unknown_thread_is_noop() {
-        let mut t = BotTurnTracker::new(5);
-        t.on_human_message("unknown"); // should not panic
-    }
-
-    /// Two-bot ping-pong: both bots' messages count toward the same per-thread
-    /// limit. With soft_limit=20, the limit triggers after 20 total bot messages
-    /// (~10 per bot). This simulates what each bot's process sees when the
-    /// tracker runs before self-check — own messages are counted too. (#483)
-    #[test]
-    fn two_bot_pingpong_hits_soft_limit() {
-        let mut t = BotTurnTracker::new(20);
-        // Simulate 20 bot messages (alternating bot A and bot B,
-        // but the tracker doesn't distinguish — it just counts)
-        for i in 1..20 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
-    }
-
-    /// Human message in the middle of a ping-pong resets the counter,
-    /// allowing bots to continue.
-    #[test]
-    fn two_bot_pingpong_human_resets() {
-        let mut t = BotTurnTracker::new(20);
-        for _ in 0..15 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        t.on_human_message("t1"); // human intervenes at 15
-        for _ in 0..15 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok); // can do 15 more
-        }
-        // now at 15 again, 5 more to hit limit
-        for _ in 0..4 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
-    }
-
     // --- resolve_mentions tests ---
 
     /// Bot's own <@UID> mention is stripped from the prompt.
@@ -1074,6 +945,35 @@ mod tests {
         let bot_id = UserId::new(111);
         let result = resolve_mentions("<@111>", bot_id);
         assert_eq!(result, "");
+    }
+
+    // --- thread-race error detection ---
+
+    /// Detects the Discord error code for "thread already exists" (160004).
+    #[test]
+    fn is_thread_already_exists_matches_code() {
+        let err = anyhow::Error::msg(
+            r#"HTTP error: {"code": 160004, "message": "A thread has already been created for this message."}"#,
+        );
+        assert!(is_thread_already_exists_error(&err));
+    }
+
+    /// Detects the human-readable form of the error in case serenity renders
+    /// it without the numeric code.
+    #[test]
+    fn is_thread_already_exists_matches_message() {
+        let err = anyhow::anyhow!("A thread has already been created for this message.");
+        assert!(is_thread_already_exists_error(&err));
+    }
+
+    /// Unrelated errors do not match — we don't want the fallback path
+    /// swallowing real failures like permission denied.
+    #[test]
+    fn is_thread_already_exists_ignores_other_errors() {
+        let err = anyhow::anyhow!("Missing Permissions");
+        assert!(!is_thread_already_exists_error(&err));
+        let err = anyhow::anyhow!("rate limit exceeded");
+        assert!(!is_thread_already_exists_error(&err));
     }
 
     // --- should_process_user_message tests (GIVEN/WHEN/THEN) ---
@@ -1179,49 +1079,6 @@ mod tests {
             true,           // involved
             false,          // other_bot_present
         ));
-    }
-
-    /// After soft limit fires once (n==20), subsequent bot messages still return
-    /// SoftLimit but with n>20. The caller warns only when n==max (exact hit),
-    /// preventing warning messages from ping-ponging between bots.
-    #[test]
-    fn soft_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(20);
-        for _ in 0..19 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        // n==20: exact hit — caller should send warning
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
-        // n==21: past limit — caller should silently return (no warning)
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
-        // n==22: still past — still silent
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
-    }
-
-    /// Hard limit also carries count for warn-once semantics.
-    #[test]
-    fn hard_limit_warn_once_semantics() {
-        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1); // soft > hard so hard fires first
-        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
-            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        }
-        // Exact hit — warn
-        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
-        // Past — silent
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Stopped);
-    }
-
-    /// Regression test for #497: system messages (thread created, pin, etc.)
-    /// should NOT reset the bot turn counter. The filtering happens at the
-    /// call site (MessageType check); this verifies the counter stays put
-    /// when on_human_message is never called.
-    #[test]
-    fn system_message_does_not_reset_counter() {
-        let mut t = BotTurnTracker::new(3);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
-        // No on_human_message (system message filtered out at call site)
-        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
     }
 
     // --- is_thread_channel tests (regression for #518) ---
