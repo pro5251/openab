@@ -1,0 +1,36 @@
+# ==============================================================================
+# 蒙摯 — Ops Agent
+# CLI: gemini (Gemini CLI)   模型: gemini-2.5-pro
+# 角色: 環境設定、部署、容器、CI/CD
+# ==============================================================================
+
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN_MENGZHI}"
+allow_all_channels = true
+allow_user_messages = "multibot-mentions"
+allow_bot_messages = "mentions"
+# trusted_bot_ids = ["1498633798093508748"]  # 只接受梅長蘇的指派
+allowed_users = ["550093162430070804"]  # 允許的使用者
+
+[agent]
+command = "gemini"
+args = ["--acp"]
+working_dir = "/workspace/devops"
+env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+[pool]
+max_sessions = 5
+session_ttl_hours = 24
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[reactions.emojis]
+queued   = "👀"
+thinking = "🔧"
+tool     = "🔥"
+coding   = "🚀"
+web      = "⚡"
+done     = "🆗"
+error    = "😱"

@@ -1,0 +1,44 @@
+# ==============================================================================
+# 梅長蘇 — Architect Agent
+# CLI: copilot (GitHub Copilot CLI)   模型: Claude Sonnet 4.6
+# 角色: 系統設計、架構決策、跨模組協調
+# ==============================================================================
+
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN_MEICHANGSU}"
+allow_all_channels = true
+allow_user_messages = "multibot-mentions"
+allow_bot_messages = "mentions"
+# trusted_bot_ids = ["1498633798093508748"]     # 只接受梅長蘇的指派
+allow_all_users = false
+allowed_users = ["550093162430070804"]        # 允許的使用者
+
+# [agent]
+# command = "copilot"
+# args = ["--acp"]
+# working_dir = "./workspace"
+# env = { GH_TOKEN = "${COPILOT_GITHUB_TOKEN}" }
+
+
+[agent]
+command = "gemini"
+args = ["--acp"]
+working_dir = "/workspace"
+env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+[pool]
+max_sessions = 5
+session_ttl_hours = 24
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[reactions.emojis]
+queued = "👀"
+thinking = "🏛️"
+tool = "🔥"
+coding = "📐"
+web = "⚡"
+done = "🆗"
+error = "😱"
